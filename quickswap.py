@@ -1,11 +1,11 @@
 import argparse
-import os
-import sys
 import glob
-import time
-import subprocess
-import threading
+import os
 import queue
+import subprocess
+import sys
+import threading
+import time
 import urllib.request
 
 import cv2
@@ -189,7 +189,8 @@ class Pipeline:
     face_landmark_68 = transform_points(face_landmark_68, cv2.invertAffineTransform(rotation_matrix))
     face_landmark_68 = transform_points(face_landmark_68, cv2.invertAffineTransform(affine_matrix))
 
-    return convert_to_face_landmark_5(face_landmark_68)
+    face_landmark_5 = convert_to_face_landmark_5(face_landmark_68)
+    return face_landmark_5, face_landmark_68
 
   def get_embedding(self, frame, landmarks):
     crop, _ = warp_face(frame, landmarks, 'arcface_112', (112, 112))
@@ -203,8 +204,10 @@ class Pipeline:
     debug_data = []
 
     for face in faces:
+      yolo_landmarks = face['landmarks'].copy()
+
       # Step 1: Use 2DFAN4 to lock down a flawless 5-point alignment, overriding YOLO
-      stable_landmarks = self.refine_landmarks(frame, face['bbox'])
+      stable_landmarks, stable_68_landmarks = self.refine_landmarks(frame, face['bbox'])
       vid_emb = self.get_embedding(frame, stable_landmarks)
 
       best_dist = 1.0
@@ -219,7 +222,10 @@ class Pipeline:
 
       # Inject stable landmarks for the remaining swap/enhance stages
       face['landmarks'] = stable_landmarks
-      debug_data.append({'face': face, 'dist': best_dist, 'swapped': best_src_emb is not None})
+      debug_data.append({
+        'bbox': face['bbox'], 'score': face['score'], 'dist': best_dist, 'swapped': best_src_emb is not None, 'yolo_5': yolo_landmarks, 'stable_68': stable_68_landmarks,
+        'stable_5': stable_landmarks
+      })
       if best_src_emb is None:
         continue
 
@@ -258,9 +264,8 @@ class Pipeline:
     if debug:
       cv2.putText(out_frame, f"Frame: {frame_num}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
       for data in debug_data:
-        face = data['face']
-        bbox = face['bbox'].astype(int)
-        score = face['score']
+        bbox = data['bbox'].astype(int)
+        score = data['score']
         dist = data['dist']
         swapped = data['swapped']
 
@@ -271,6 +276,19 @@ class Pipeline:
         label = f"Conf:{score:.2f} Sim:{sim_score:.2f}"
         text_y = max(bbox[1] - 10, 20)
         cv2.putText(out_frame, label, (bbox[0], text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # Draw YOLO 5-points (Red)
+        for pt in data['yolo_5']:
+          cv2.circle(out_frame, (int(pt[0]), int(pt[1])), 2, (0, 0, 255), -1)
+
+        # Draw 2DFAN4 68-points (White)
+        for pt in data['stable_68']:
+          cv2.circle(out_frame, (int(pt[0]), int(pt[1])), 1, (255, 255, 255), -1)
+
+        # Draw Refined 5-points (Green)
+        for pt in data['stable_5']:
+          cv2.circle(out_frame, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
+
     return out_frame.astype(np.uint8)
 
 
@@ -361,8 +379,8 @@ def main():
       continue
 
     # Extract clean 68->5 points for the templates
-    ref_landmarks = pipe.refine_landmarks(ref_img, ref_faces[0]['bbox'])
-    src_landmarks = pipe.refine_landmarks(src_img, src_faces[0]['bbox'])
+    ref_landmarks, _ = pipe.refine_landmarks(ref_img, ref_faces[0]['bbox'])
+    src_landmarks, _ = pipe.refine_landmarks(src_img, src_faces[0]['bbox'])
 
     ref_emb = pipe.get_embedding(ref_img, ref_landmarks)
     src_emb = pipe.get_embedding(src_img, src_landmarks)

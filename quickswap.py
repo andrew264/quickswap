@@ -14,6 +14,13 @@ import onnxruntime
 from tqdm import tqdm
 
 # ==========================================
+# 0. GLOBAL CONFIGURATION & THRESHOLDS
+# ==========================================
+
+FACE_DISTANCE_THRESHOLD = 0.65  # Max similarity distance (0.0 to 1.0 mapped). Increase to be more lenient.
+FACE_DETECTOR_SCORE = 0.5  # Minimum confidence score for a face to be recognized by YOLO.
+
+# ==========================================
 # 1. TEMPLATES & MATH
 # ==========================================
 
@@ -60,12 +67,37 @@ def explode_pixel_boost(frames, boost_total=2, model_size=(256, 256), boost_size
   return crop.transpose(2, 0, 3, 1, 4).reshape(boost_size[0], boost_size[1], 3)
 
 
+# 2DFAN4 Exact Spatial Utilities
+def warp_face_by_translation(temp_vision_frame, translation, scale, crop_size):
+  affine_matrix = np.array([[scale, 0, translation[0]], [0, scale, translation[1]]])
+  crop_vision_frame = cv2.warpAffine(temp_vision_frame, affine_matrix, crop_size)
+  return crop_vision_frame, affine_matrix
+
+
+def transform_points(points, matrix):
+  points = points.reshape(-1, 1, 2)
+  points = cv2.transform(points, matrix)
+  return points.reshape(-1, 2)
+
+
+def conditional_optimize_contrast(crop_vision_frame):
+  crop_vision_frame = cv2.cvtColor(crop_vision_frame, cv2.COLOR_RGB2LAB)
+  if np.mean(crop_vision_frame[:, :, 0]) < 30:
+    crop_vision_frame[:, :, 0] = cv2.createCLAHE(clipLimit=2).apply(crop_vision_frame[:, :, 0])
+  return cv2.cvtColor(crop_vision_frame, cv2.COLOR_LAB2RGB)
+
+
+def convert_to_face_landmark_5(face_landmark_68):
+  return np.array([np.mean(face_landmark_68[36:42], axis=0), np.mean(face_landmark_68[42:48], axis=0), face_landmark_68[30], face_landmark_68[48], face_landmark_68[54]])
+
+
 # ==========================================
 # 2. MODELS & DOWNLOADER
 # ==========================================
 
 MODELS = {
   'yoloface': 'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/yoloface_8n.onnx',
+  '2dfan4': 'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/2dfan4.onnx',
   'arcface': 'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/arcface_w600k_r50.onnx',
   'hyperswap': 'https://github.com/facefusion/facefusion-assets/releases/download/models-3.3.0/hyperswap_1a_256.onnx',
   'gfpgan': 'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/gfpgan_1.4.onnx'
@@ -95,6 +127,7 @@ class Pipeline:
     opt.log_severity_level = 3
 
     self.yolo = onnxruntime.InferenceSession(model_paths['yoloface'], sess_options=opt, providers=providers)
+    self.landmarker = onnxruntime.InferenceSession(model_paths['2dfan4'], sess_options=opt, providers=providers)
     self.arcface = onnxruntime.InferenceSession(model_paths['arcface'], sess_options=opt, providers=providers)
     self.swapper = onnxruntime.InferenceSession(model_paths['hyperswap'], sess_options=opt, providers=providers)
     self.enhancer = onnxruntime.InferenceSession(model_paths['gfpgan'], sess_options=opt, providers=providers)
@@ -113,7 +146,7 @@ class Pipeline:
     detection = np.squeeze(detection).T
     bboxes_raw, scores_raw, landmarks_raw = np.split(detection, [4, 5], axis=1)
 
-    keep = np.where(scores_raw > 0.5)[0]
+    keep = np.where(scores_raw > FACE_DETECTOR_SCORE)[0]
     faces = []
     if len(keep) > 0:
       bboxes = bboxes_raw[keep]
@@ -126,10 +159,37 @@ class Pipeline:
       landmarks = (landmarks - [pad_x, pad_y]) / scale
 
       bboxes_nms = [(x1, y1, x2 - x1, y2 - y1) for x1, y1, x2, y2 in bboxes]
-      indices = cv2.dnn.NMSBoxes(bboxes_nms, scores, 0.5, 0.4)
+      indices = cv2.dnn.NMSBoxes(bboxes_nms, scores, FACE_DETECTOR_SCORE, 0.4)
       for i in indices:
         faces.append({'bbox': bboxes[i], 'landmarks': landmarks[i], 'score': float(scores[i])})
     return faces
+
+  def refine_landmarks(self, frame, bbox):
+    """ Passes bbox to 2DFAN4 to extract exact 68-point mesh, then slices back to highly-stable 5-point """
+    model_size = (256, 256)
+    np_model_size = np.array(model_size)
+
+    scale = 195 / np.subtract(bbox[2:], bbox[:2]).max().clip(1, None)
+    translation = (np_model_size[0] - np.add(bbox[2:], bbox[:2]) * scale) * 0.5
+
+    crop_vision_frame, affine_matrix = warp_face_by_translation(frame, translation, scale, model_size)
+
+    rotation_matrix = cv2.getRotationMatrix2D((np_model_size[0] / 2, np_model_size[1] / 2), 0, 1)
+    rotation_size = np.dot(np.abs(rotation_matrix[:, :2]), np_model_size)
+    rotation_matrix[:, -1] += (rotation_size - np_model_size) * 0.5
+    rotation_size = (int(rotation_size[0]), int(rotation_size[1]))
+
+    crop_vision_frame = cv2.warpAffine(crop_vision_frame, rotation_matrix, rotation_size)
+    crop_vision_frame = conditional_optimize_contrast(crop_vision_frame)
+    crop_vision_frame = crop_vision_frame.transpose(2, 0, 1).astype(np.float32) / 255.0
+
+    prediction = self.landmarker.run(None, {'input': [crop_vision_frame]})
+    face_landmark_68 = prediction[0][:, :, :2][0] / 64 * 256
+
+    face_landmark_68 = transform_points(face_landmark_68, cv2.invertAffineTransform(rotation_matrix))
+    face_landmark_68 = transform_points(face_landmark_68, cv2.invertAffineTransform(affine_matrix))
+
+    return convert_to_face_landmark_5(face_landmark_68)
 
   def get_embedding(self, frame, landmarks):
     crop, _ = warp_face(frame, landmarks, 'arcface_112', (112, 112))
@@ -143,21 +203,27 @@ class Pipeline:
     debug_data = []
 
     for face in faces:
-      vid_emb = self.get_embedding(frame, face['landmarks'])
+      # Step 1: Use 2DFAN4 to lock down a flawless 5-point alignment, overriding YOLO
+      stable_landmarks = self.refine_landmarks(frame, face['bbox'])
+      vid_emb = self.get_embedding(frame, stable_landmarks)
 
       best_dist = 1.0
       best_src_emb = None
       for ref_emb, src_emb in pairs:
         dist = 1 - np.dot(vid_emb, ref_emb)
-        if dist < best_dist and dist < 0.4:
-          best_dist = dist
+        mapped_dist = np.interp(dist, [0, 2], [0, 1])  # Map to 0-1 scale identical to FaceFusion
+
+        if mapped_dist < best_dist and mapped_dist < FACE_DISTANCE_THRESHOLD:
+          best_dist = mapped_dist
           best_src_emb = src_emb
 
+      # Inject stable landmarks for the remaining swap/enhance stages
+      face['landmarks'] = stable_landmarks
       debug_data.append({'face': face, 'dist': best_dist, 'swapped': best_src_emb is not None})
       if best_src_emb is None:
         continue
 
-      # 1. Hyperswap with 512x512 Pixel Boost
+      # 2. Hyperswap with 512x512 Pixel Boost
       crop_swap, mat_swap = warp_face(out_frame, face['landmarks'], 'arcface_128', (512, 512))
       crop_swap_norm = (crop_swap[..., ::-1] / 255.0 - 0.5) / 0.5
       tiles = implode_pixel_boost(crop_swap_norm, 2, (256, 256))
@@ -174,7 +240,7 @@ class Pipeline:
       swapped_512 = np.round(swapped_512 * 255.0).astype(np.uint8)[..., ::-1]
       out_frame = paste_back(out_frame, swapped_512, mat_swap)
 
-      # 2. Enhance with GFPGAN (80% blend)
+      # 3. Enhance with GFPGAN (80% blend)
       crop_enh, mat_enh = warp_face(out_frame, face['landmarks'], 'ffhq_512', (512, 512))
       blob_enh = (crop_enh[..., ::-1] / 255.0 - 0.5) / 0.5
       blob_enh = blob_enh.transpose(2, 0, 1).astype(np.float32)[np.newaxis, ...]
@@ -188,6 +254,7 @@ class Pipeline:
       crop_enh = crop_enh.astype(np.uint8)
       blended = cv2.addWeighted(crop_enh, 0.2, enhanced, 0.8, 0)
       out_frame = paste_back(out_frame, blended, mat_enh)
+
     if debug:
       cv2.putText(out_frame, f"Frame: {frame_num}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
       for data in debug_data:
@@ -293,8 +360,12 @@ def main():
       print(f"Warning: Could not detect faces in {base_name} pair. Skipping.")
       continue
 
-    ref_emb = pipe.get_embedding(ref_img, ref_faces[0]['landmarks'])
-    src_emb = pipe.get_embedding(src_img, src_faces[0]['landmarks'])
+    # Extract clean 68->5 points for the templates
+    ref_landmarks = pipe.refine_landmarks(ref_img, ref_faces[0]['bbox'])
+    src_landmarks = pipe.refine_landmarks(src_img, src_faces[0]['bbox'])
+
+    ref_emb = pipe.get_embedding(ref_img, ref_landmarks)
+    src_emb = pipe.get_embedding(src_img, src_landmarks)
     pairs.append((ref_emb, src_emb))
 
   if not pairs:

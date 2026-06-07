@@ -11,6 +11,7 @@ wheels/
 
 # Models
 .models
+.trt_cache
 
 # ide files
 .idea/

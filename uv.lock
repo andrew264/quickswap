@@ -227,6 +227,7 @@ dependencies = [
     { name = "nvidia-cusparse-cu12" },
     { name = "onnxruntime-gpu" },
     { name = "opencv-python" },
+    { name = "tensorrt-cu12-libs" },
     { name = "tqdm" },
 ]
 
@@ -241,8 +242,15 @@ requires-dist = [
     { name = "nvidia-cusparse-cu12", specifier = ">=12.5.10.65" },
     { name = "onnxruntime-gpu", specifier = ">=1.26.0" },
     { name = "opencv-python", specifier = ">=4.13.0.92" },
+    { name = "tensorrt-cu12-libs", specifier = ">=10.16.1.11" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
+
+[[package]]
+name = "tensorrt-cu12-libs"
+version = "10.16.1.11"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/9b/8d5b85c7cb7feaead7d462e81a4592a9d4ad3f581798f65ed34b765441f3/tensorrt_cu12_libs-10.16.1.11.tar.gz", hash = "sha256:53b45a3e82bead09638e7a3ddf4b927254b81fa0d924fe3fe594420a09ebf48b", size = 15757, upload-time = "2026-04-07T19:42:58.348Z" }
 
 [[package]]
 name = "tqdm"

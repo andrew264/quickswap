@@ -13,12 +13,15 @@ import numpy as np
 import onnxruntime
 from tqdm import tqdm
 
+onnxruntime.set_default_logger_severity(3)
+
 # ==========================================
 # 0. GLOBAL CONFIGURATION & THRESHOLDS
 # ==========================================
 
-FACE_DISTANCE_THRESHOLD = 0.65  # Max similarity distance (0.0 to 1.0 mapped). Increase to be more lenient.
+FACE_DISTANCE_THRESHOLD = 0.4  # Max similarity distance (0.0 to 1.0 mapped). Increase to be more lenient.
 FACE_DETECTOR_SCORE = 0.5  # Minimum confidence score for a face to be recognized by YOLO.
+MAX_SWAPS_PER_REFERENCE = 1 # Maximum times a single reference face can be swapped per frame.
 
 # ==========================================
 # 1. TEMPLATES & MATH
@@ -122,15 +125,33 @@ def download_models(model_dir=".models"):
 
 class Pipeline:
   def __init__(self, model_paths):
-    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    trt_cache_dir = os.path.abspath(".trt_cache")
+    os.makedirs(trt_cache_dir, exist_ok=True)
+
+    trt_providers = [('TensorrtExecutionProvider', {
+      'trt_engine_cache_enable': True, 'trt_engine_cache_path': trt_cache_dir, 'trt_timing_cache_enable': True, 'trt_timing_cache_path': trt_cache_dir,
+      'trt_builder_optimization_level': 4
+    }), ('CUDAExecutionProvider', {'cudnn_conv_algo_search': 'DEFAULT'}), 'CPUExecutionProvider']
+
+    gfpgan_trt = [('TensorrtExecutionProvider', {
+      'trt_engine_cache_enable': True, 'trt_engine_cache_path': trt_cache_dir, 'trt_builder_optimization_level': 2, 'trt_fp16_enable': False,
+    }), ('CUDAExecutionProvider', {'cudnn_conv_algo_search': 'DEFAULT'}), 'CPUExecutionProvider']
+
     opt = onnxruntime.SessionOptions()
     opt.log_severity_level = 3
 
-    self.yolo = onnxruntime.InferenceSession(model_paths['yoloface'], sess_options=opt, providers=providers)
-    self.landmarker = onnxruntime.InferenceSession(model_paths['2dfan4'], sess_options=opt, providers=providers)
-    self.arcface = onnxruntime.InferenceSession(model_paths['arcface'], sess_options=opt, providers=providers)
-    self.swapper = onnxruntime.InferenceSession(model_paths['hyperswap'], sess_options=opt, providers=providers)
-    self.enhancer = onnxruntime.InferenceSession(model_paths['gfpgan'], sess_options=opt, providers=providers)
+    print("Initializing ONNX models...")
+
+    self.yolo = onnxruntime.InferenceSession(model_paths['yoloface'], sess_options=opt, providers=trt_providers)
+    print("Loaded YOLO model")
+    self.landmarker = onnxruntime.InferenceSession(model_paths['2dfan4'], sess_options=opt, providers=trt_providers)
+    print("Loaded 2DFAN4 model")
+    self.arcface = onnxruntime.InferenceSession(model_paths['arcface'], sess_options=opt, providers=trt_providers)
+    print("Loaded ARCFACE model")
+    self.swapper = onnxruntime.InferenceSession(model_paths['hyperswap'], sess_options=opt, providers=trt_providers)
+    print("Loaded HyperSwap model")
+    self.enhancer = onnxruntime.InferenceSession(model_paths['gfpgan'], sess_options=opt, providers=gfpgan_trt)
+    print("Loaded GFPGAN model")
 
   def detect_faces(self, frame):
     h, w = frame.shape[:2]
@@ -200,8 +221,14 @@ class Pipeline:
 
   def process_frame(self, frame, pairs, frame_num=0, debug=False):
     faces = self.detect_faces(frame)
+    # Sort faces by bounding box area (largest first)
+    faces = sorted(faces, key=lambda f: (f['bbox'][2] - f['bbox'][0]) * (f['bbox'][3] - f['bbox'][1]), reverse=True)
+
     out_frame = frame.copy()
     debug_data = []
+
+    # Track how many times each reference pair has been used in this frame
+    usage_count = {i: 0 for i in range(len(pairs))}
 
     for face in faces:
       yolo_landmarks = face['landmarks'].copy()
@@ -212,13 +239,22 @@ class Pipeline:
 
       best_dist = 1.0
       best_src_emb = None
-      for ref_emb, src_emb in pairs:
+      best_pair_idx = -1
+
+      for i, (ref_emb, src_emb) in enumerate(pairs):
+        if usage_count[i] >= MAX_SWAPS_PER_REFERENCE:
+          continue
+
         dist = 1 - np.dot(vid_emb, ref_emb)
         mapped_dist = np.interp(dist, [0, 2], [0, 1])  # Map to 0-1 scale identical to FaceFusion
 
         if mapped_dist < best_dist and mapped_dist < FACE_DISTANCE_THRESHOLD:
           best_dist = mapped_dist
           best_src_emb = src_emb
+          best_pair_idx = i
+
+      if best_pair_idx != -1:
+        usage_count[best_pair_idx] += 1
 
       # Inject stable landmarks for the remaining swap/enhance stages
       face['landmarks'] = stable_landmarks
